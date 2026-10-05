@@ -13,13 +13,13 @@ from .database import (
     get_conn,
     get_db,
     get_principal_key_row,
-    get_secret,
     get_secret_at_generation,
     init_db,
     insert_redemption,
     insert_revocation,
     install_next_key_generation,
     load_chain_key_generations,
+    load_chain_missing_issuers,
     load_chain_record,
     load_redemption_by_request_key,
     load_redemption_for_token,
@@ -79,19 +79,25 @@ app = FastAPI(
 
 
 def _chain_secret_lookup(conn: sqlite3.Connection, chain_id: str):
-    """按链提交时锁定的密钥代次构造验签查询。
+    """按链提交时锁定的密钥归属构造验签查询。
 
     - 提交时已注册的主体：固定使用链归属记录中的那一代密钥——轮换不影响
       既有链的验签结论，既有无效链也不会因新密钥恰好匹配而翻转为有效；
-    - 提交时未注册的主体（无归属记录）：回退到当前密钥，保留“主体后注册
-      可补验”的既有语义。
+    - 提交时未注册的主体（缺失事实已随链持久化）：一律按 unknown_issuer
+      处理——事后注册该主体、甚至轮换到匹配旧签名的密钥，都不会让旧链
+      在查询 / 重放 / 求值 / 核销中翻转为有效；
+    - 归属表与缺失表都无记录（只会出现在尚未回填的极旧数据上）：同样按
+      提交时未注册处理，拒绝放行。
     """
     recorded = load_chain_key_generations(conn, chain_id)
+    missing = load_chain_missing_issuers(conn, chain_id)
 
     def lookup(name: str) -> str | None:
+        if name in missing:
+            return None
         generation = recorded.get(name)
         if generation is None:
-            return get_secret(conn, name)
+            return None
         return get_secret_at_generation(conn, name, generation)
 
     return lookup
@@ -167,6 +173,8 @@ def submit_chain(
 
     验签严格使用“提交时各签发主体的当前密钥代次”快照，并把该代次归属随链
     持久化：与并发轮换交错时，链的密钥归属与提交时的验签结果始终一致。
+    提交时未注册的签发者同样把“缺失密钥”这一事实随链持久化：事后注册该
+    主体（或轮换到匹配旧签名的密钥）都不会让这条链的验签结论翻转。
     """
     received_hash = canonical_submission_hash(
         submission.chain_id, submission.tokens
@@ -199,10 +207,10 @@ def submit_chain(
             },
         )
 
-    # 新链：先快照各签发主体的当前密钥与代次，验签与归属记录使用同一快照
-    snapshot = snapshot_current_keys(
-        conn, {t.issuer for t in submission.tokens}
-    )
+    # 新链：先快照各签发主体的当前密钥与代次，验签与归属记录使用同一快照；
+    # 快照之外的签发者（提交时未注册）把“缺失密钥”事实一并随链持久化
+    issuers = {t.issuer for t in submission.tokens}
+    snapshot = snapshot_current_keys(conn, issuers)
     report, _ = validate_chain(
         submission,
         lambda name: snapshot[name][0] if name in snapshot else None,
@@ -213,6 +221,7 @@ def submit_chain(
         received_hash,
         report,
         {name: generation for name, (_, generation) in snapshot.items()},
+        missing_issuers=issuers - snapshot.keys(),
     )
     result = SubmissionResult(
         chain_id=submission.chain_id, replayed=False, integrity=report

@@ -61,6 +61,17 @@ CREATE TABLE IF NOT EXISTS chain_key_generations (
     FOREIGN KEY (chain_id) REFERENCES chains (chain_id)
 );
 
+-- 每条链在提交时“签发主体未注册、无法取得密钥”的事实（随链写入，之后不可变）。
+-- 与 chain_key_generations 互补：归属表记录提交时已注册主体的代次，本表记录
+-- 提交时未注册的主体。事后注册该主体（甚至轮换到匹配旧签名的密钥）都不会让
+-- 旧链的 unknown_issuer 结论翻转。
+CREATE TABLE IF NOT EXISTS chain_missing_issuers (
+    chain_id   TEXT NOT NULL,
+    principal  TEXT NOT NULL,
+    PRIMARY KEY (chain_id, principal),
+    FOREIGN KEY (chain_id) REFERENCES chains (chain_id)
+);
+
 -- 撤销事件为只追加（append-only）审计记录：无更新 / 删除路径。
 -- request_key 全局唯一（跨链也不可复用）；同一令牌至多一条有效撤销事件。
 CREATE TABLE IF NOT EXISTS revocations (
@@ -170,7 +181,7 @@ def _backfill_key_tables(conn: sqlite3.Connection) -> None:
 
     - 尚无密钥历史的主体：以其当前 hmac_secret 作为第 1 代（轮换过的主体已有
       历史行，INSERT OR IGNORE 自然跳过，不会用当前密钥覆盖旧代次）；
-    - 既有链：按提交内出现且当时已注册的签发者，归属到第 1 代。
+    - 既有链的密钥归属回填见 :func:`_backfill_chain_attributions`。
     """
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
@@ -179,12 +190,75 @@ def _backfill_key_tables(conn: sqlite3.Connection) -> None:
         "SELECT name, 1, hmac_secret, ? FROM principals",
         (now,),
     )
-    conn.execute(
-        "INSERT OR IGNORE INTO chain_key_generations (chain_id, principal, generation) "
-        "SELECT DISTINCT t.chain_id, json_extract(t.token_json, '$.issuer'), 1 "
-        "FROM tokens t JOIN principals p "
-        "ON p.name = json_extract(t.token_json, '$.issuer')"
-    )
+    _backfill_chain_attributions(conn)
+
+
+def _backfill_chain_attributions(conn: sqlite3.Connection) -> None:
+    """回填既有链的“提交时密钥归属”（幂等，可每次启动执行）。
+
+    以随链保存的提交时完整性报告为准区分两类签发者：
+
+    - 报告中含 ``unknown_issuer`` 失败的主体：提交时未注册。把缺失事实记入
+      ``chain_missing_issuers``，并清除早期版本误写入的代次归属——绝不把
+      提交时未注册的签发者归到后来注册的密钥代次；
+    - 其余签发者：提交时已注册（轮换功能上线前只有一代密钥），归属到第 1 代，
+      原本有效的旧链继续按该历史密钥验签。
+    """
+    chains = conn.execute("SELECT chain_id, report_json FROM chains").fetchall()
+    if not chains:
+        return
+    issuers_by_chain: dict[str, set[str]] = {}
+    for row in conn.execute(
+        "SELECT DISTINCT chain_id, "
+        "json_extract(token_json, '$.issuer') AS issuer FROM tokens"
+    ).fetchall():
+        issuers_by_chain.setdefault(row["chain_id"], set()).add(row["issuer"])
+    registered = {
+        row["name"] for row in conn.execute("SELECT name FROM principals").fetchall()
+    }
+    for chain in chains:
+        chain_id = chain["chain_id"]
+        unknown = _report_unknown_issuers(chain["report_json"])
+        for name in sorted(unknown):
+            conn.execute(
+                "DELETE FROM chain_key_generations "
+                "WHERE chain_id = ? AND principal = ?",
+                (chain_id, name),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO chain_missing_issuers (chain_id, principal) "
+                "VALUES (?, ?)",
+                (chain_id, name),
+            )
+        for name in sorted(issuers_by_chain.get(chain_id, set()) - unknown):
+            if name in registered:
+                conn.execute(
+                    "INSERT OR IGNORE INTO chain_key_generations "
+                    "(chain_id, principal, generation) VALUES (?, ?, 1)",
+                    (chain_id, name),
+                )
+
+
+def _report_unknown_issuers(report_json: str) -> set[str]:
+    """从随链保存的提交时报告中提取验签时未注册的签发者（解析失败按空集处理）。"""
+    try:
+        report = json.loads(report_json)
+    except ValueError:
+        return set()
+    if not isinstance(report, dict):
+        return set()
+    unknown: set[str] = set()
+    for node in report.get("trace") or []:
+        if not isinstance(node, dict):
+            continue
+        for check in node.get("checks") or []:
+            if not isinstance(check, dict):
+                continue
+            if check.get("reason") == "unknown_issuer" and not check.get("passed", True):
+                issuer = node.get("issuer")
+                if isinstance(issuer, str) and issuer:
+                    unknown.add(issuer)
+    return unknown
 
 
 def get_secret(conn: sqlite3.Connection, name: str) -> str | None:
@@ -288,14 +362,31 @@ def load_chain_key_generations(
     return {r["principal"]: r["generation"] for r in rows}
 
 
+def load_chain_missing_issuers(
+    conn: sqlite3.Connection, chain_id: str
+) -> set[str]:
+    """链在提交时未注册（无法取得密钥）的签发主体集合（无记录时为空集）。"""
+    rows = conn.execute(
+        "SELECT principal FROM chain_missing_issuers WHERE chain_id = ?",
+        (chain_id,),
+    ).fetchall()
+    return {r["principal"] for r in rows}
+
+
 def save_chain(
     conn: sqlite3.Connection,
     submission: ChainSubmission,
     content_sha256: str,
     report: IntegrityReport,
     key_generations: dict[str, int],
+    missing_issuers: Iterable[str] = (),
 ) -> None:
-    """持久化链及其提交时锁定的密钥代次归属（同一事务，要么全部落库要么都不落）。"""
+    """持久化链及其提交时锁定的密钥归属（同一事务，要么全部落库要么都不落）。
+
+    ``key_generations`` 记录提交时已注册主体的密钥代次；``missing_issuers``
+    记录提交时未注册的主体——“提交时缺失密钥”这一事实随链保存，事后注册
+    不改变旧链的验签结论。
+    """
     created_at = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "INSERT INTO chains (chain_id, content_sha256, report_json, created_at) "
@@ -321,6 +412,10 @@ def save_chain(
             (submission.chain_id, name, generation)
             for name, generation in sorted(key_generations.items())
         ],
+    )
+    conn.executemany(
+        "INSERT INTO chain_missing_issuers (chain_id, principal) VALUES (?, ?)",
+        [(submission.chain_id, name) for name in sorted(missing_issuers)],
     )
 
 

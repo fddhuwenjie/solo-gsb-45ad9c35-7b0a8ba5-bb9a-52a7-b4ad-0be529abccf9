@@ -16,7 +16,10 @@
    判定拒绝与目标不符均不核销、不占用 `request_key`；
 8. **HMAC 密钥轮换** —— 签发主体的密钥按**代次**管理：注册为第 1 代，每次轮换原子地追加一代并切换当前代。
    轮换后新提交的链只按新密钥验签；每条链在提交时锁定各签发主体的密钥代次，
-   轮换前保存的链在链查询、只读求值与首次核销中继续按锁定代次的密钥重验，结论不变。
+   轮换前保存的链在链查询、只读求值与首次核销中继续按锁定代次的密钥重验，结论不变；
+9. **提交时未注册签发者的结论冻结** —— 提交时签发者未注册（`unknown_issuer`）的链，
+   把“缺失密钥”这一事实随链持久化：事后注册该主体、甚至轮换到匹配旧签名的密钥，
+   链查询 / 重放 / 求值 / 首次核销都保持提交时的拒绝结论，永不翻转。
 
 相同 `chain_id` 的重放**幂等**（返回 200 + `replayed=true`）；相同 `chain_id` 内容变化返回 **409 Conflict**。
 撤销与核销同样按 `request_key` 幂等：同键同内容重放原结果，同键换目标/内容返回 **409 Conflict**。
@@ -566,6 +569,117 @@ curl -sS -X POST http://localhost:8000/api/v1/chains/rot-chain-after/redeem \
 
 ---
 
+## 提交时未注册签发者的链：结论永不翻转
+
+**问题**（修复前可重现）：一条链提交时签发者尚未注册，验签以 `unknown_issuer`
+失败并随链持久化。但旧版本只为“提交时已注册”的主体记录密钥代次，未注册主体
+在重验时回退到**当前密钥**——于是事后注册该主体、并轮换到恰好匹配旧签名的
+密钥后，同内容重放与只读求值会翻转为放行，首次核销甚至返回 `201` 核销成功；
+重启时的回填还会把这类旧链误绑到后来注册的密钥代次，重启后同样翻转。
+
+**修复**：提交时“签发者未注册、缺失密钥”这一事实随链持久化
+（`chain_missing_issuers` 表，与代次归属表互补）。链查询、同内容重放、只读求值
+与首次核销对该类链一律保持提交时的 `unknown_issuer` 拒绝；旧库回填以随链保存的
+提交时完整性报告为准——报告含 `unknown_issuer` 的签发者只记入缺失表（并清除
+早期版本误写入的代次归属），绝不归到后来注册的密钥代次；提交时已注册主体的
+旧链仍归到其历史第 1 代密钥，继续按原密钥验签。
+
+下面是一套**可直接复制执行**的 bash 复现 / 验证流程（前提同
+[密钥轮换演练](#密钥轮换演练轮换前后签名求值与核销)：服务运行在
+`http://localhost:8000`，仓库根目录，本地 Python 3.10+）：
+
+```bash
+# 签名助手：生成 root -> $2(签发者) 的两级链，child 用 $3 指定的密钥签名
+build_chain_for() {
+  PYTHONPATH=. CHAIN_ID="$1" ISSUER="$2" ISSUER_SECRET="$3" python3 - <<'PY'
+import json, os
+from datetime import datetime, timedelta, timezone
+from app.security import compute_signature
+
+chain_id      = os.environ["CHAIN_ID"]
+issuer        = os.environ["ISSUER"]
+issuer_secret = os.environ["ISSUER_SECRET"]
+root_secret   = os.environ.get("ROOT_HMAC_SECRET", "dev-root-secret-change-me")
+now = datetime.now(timezone.utc)
+nb = (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+na = (now + timedelta(hours=6)).isoformat().replace("+00:00", "Z")
+
+def token(tid, parent, iss, sub, path, methods, secret):
+    t = {
+        "token_id": tid, "parent_id": parent, "chain_id": chain_id,
+        "issuer": iss, "subject": sub, "path_pattern": path,
+        "methods": methods, "not_before": nb, "not_after": na,
+        "allow_ip": None, "signature": "",
+    }
+    t["signature"] = compute_signature(t, secret)
+    return t
+
+print(json.dumps({
+    "chain_id": chain_id,
+    "tokens": [
+        token("ghost-root",  None,        "root", issuer,
+              "/files/**", ["GET", "POST"], root_secret),
+        token("ghost-child", "ghost-root", issuer, "ghost-worker",
+              "/files/reports/*", ["GET"], issuer_secret),
+    ],
+}, ensure_ascii=False))
+PY
+}
+
+# 1) ghost 尚未注册：用“未来的第 2 代密钥”ghost-secret-v2 签名并提交
+build_chain_for ghost-chain ghost ghost-secret-v2 > /tmp/ghost-chain.json
+curl -sS -X POST http://localhost:8000/api/v1/chains \
+  -H 'Content-Type: application/json' --data @/tmp/ghost-chain.json
+# → 201，"integrity": {"allow": false, "first_failed_reason": "unknown_issuer", ...}
+#   （完整性失败同样持久化，此后链查询始终返回这份提交时报告）
+
+# 2) 事后注册 ghost（第 1 代密钥与旧签名不符）
+curl -sS -X POST http://localhost:8000/api/v1/principals \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "ghost", "hmac_secret": "ghost-secret-v1"}'
+# → 201 {"name": "ghost"}
+
+# 3) 再轮换到恰好匹配旧签名的第 2 代密钥
+curl -sS -X POST http://localhost:8000/api/v1/principals/ghost/rotate-key \
+  -H 'Content-Type: application/json' \
+  -d '{"hmac_secret": "ghost-secret-v2"}'
+# → 200 {"name": "ghost", "generation": 2, "rotated_at": "..."}
+#   此刻当前密钥已能匹配旧链签名——修复前，第 5/6/7 步会全部翻转为放行
+
+# 4) 链查询：仍是提交时落库的拒绝报告
+curl -sS http://localhost:8000/api/v1/chains/ghost-chain
+# → 200，"integrity": {"allow": false, "first_failed_reason": "unknown_issuer", ...}
+
+# 5) 同内容重放：结论与首次提交一致（修复前会翻转为 "allow": true）
+curl -sS -X POST http://localhost:8000/api/v1/chains \
+  -H 'Content-Type: application/json' --data @/tmp/ghost-chain.json
+# → 200，"replayed": true，
+#   "integrity": {"allow": false, "first_failed_reason": "unknown_issuer", ...}
+
+# 6) 只读求值：仍按 unknown_issuer 拒绝（修复前会 "decision": "allow"）
+curl -sS -X POST http://localhost:8000/api/v1/chains/ghost-chain/evaluate \
+  -H 'Content-Type: application/json' \
+  -d "{\"request_path\": \"/files/reports/q1.pdf\", \"method\": \"GET\", \
+      \"at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+# → 200，"decision": "deny", "first_failed_reason": "unknown_issuer"
+
+# 7) 首次核销：仍判定拒绝，不核销、不占 request_key（修复前会 201 核销成功）
+curl -sS -X POST http://localhost:8000/api/v1/chains/ghost-chain/redeem \
+  -H 'Content-Type: application/json' \
+  -d '{"token_id": "ghost-child", "request_key": "ghost-redeem-0001",
+       "request_path": "/files/reports/q1.pdf", "method": "GET"}'
+# → 200，"redeemed": false, "decision": "deny",
+#   "first_failed_reason": "unknown_issuer"
+```
+
+> 重启服务（`docker compose restart`，触发旧库回填）后重复第 4–7 步，结论不变：
+> 回填不会把提交时未注册的 `ghost` 归到后来注册的密钥代次。
+> 而提交时签发者已注册的链不受影响——它们仍按提交时锁定的代次验签
+> （见上节轮换演练）；撤销事件与已核销请求的同键重放也与轮换 / 注册无关，照常工作。
+> 对应回归测试见 `tests/test_unknown_issuer.py`。
+
+---
+
 ## 规范化 JSON 与签名（重要）
 
 签名覆盖除 `signature` 外的下列字段（固定集合、固定键顺序无关，因为规范化时按键排序）：
@@ -625,7 +739,7 @@ token["signature"] = compute_signature(token, issuer_secret)
 | `cycle`                   | 沿 `parent_id` 上行检测到环                |
 | `branch`                  | 同一父令牌被两个子令牌引用（链不允许分叉） |
 | `disconnected`            | 令牌无法从根授权到达                       |
-| `unknown_issuer`          | 签发主体未注册，无法取密钥                 |
+| `unknown_issuer`          | 签发主体未注册，无法取密钥（提交时未注册即永久拒绝，事后注册不翻转旧链） |
 | `bad_signature`           | HMAC 验签不通过                            |
 | `issuer_mismatch`         | 根签发者不是配置根主体，或委托者 ≠ 父主体  |
 | `path_widens`             | 子路径相对父路径构成放大                   |
@@ -659,7 +773,7 @@ token["signature"] = compute_signature(token, issuer_secret)
 │   ├── database.py    # SQLite 初始化与迁移、主体密钥代次/链/撤销/核销持久化
 │   └── config.py      # 环境变量配置
 ├── scripts/demo_chain.py
-├── tests/             # pytest：96 个用例（端到端 API、原语单测、撤销审计、一次性核销、密钥轮换）
+├── tests/             # pytest：101 个用例（端到端 API、原语单测、撤销审计、一次性核销、密钥轮换、unknown_issuer 冻结）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
