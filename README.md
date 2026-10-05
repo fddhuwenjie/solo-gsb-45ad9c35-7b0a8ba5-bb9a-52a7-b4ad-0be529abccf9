@@ -17,6 +17,8 @@
 8. **HMAC 密钥轮换** —— 签发主体的密钥按**代次**管理：注册为第 1 代，每次轮换原子地追加一代并切换当前代。
    轮换后新提交的链只按新密钥验签；每条链在提交时锁定各签发主体的密钥代次，
    轮换前保存的链在链查询、只读求值与首次核销中继续按锁定代次的密钥重验，结论不变。
+   提交时未注册的签发者（`unknown_issuer`）这一事实同样随链保存：事后注册该主体、
+   甚至轮换到恰好匹配旧签名的密钥，都不会让原验签拒绝翻转。
 
 相同 `chain_id` 的重放**幂等**（返回 200 + `replayed=true`）；相同 `chain_id` 内容变化返回 **409 Conflict**。
 撤销与核销同样按 `request_key` 幂等：同键同内容重放原结果，同键换目标/内容返回 **409 Conflict**。
@@ -172,6 +174,10 @@ curl -sS -X POST http://localhost:8000/api/v1/principals/service-a/rotate-key \
 - 每条链在**提交时**锁定各签发主体的密钥代次并随链持久化；轮换前保存的链在
   **链查询、只读求值、首次核销**中继续按锁定代次的密钥重验，验签结论与轮换前一致，
   撤销事件照常按请求时间解释；既有**无效**链不会因为新密钥恰好匹配而翻转为有效；
+- 提交时**未注册**的签发者（`unknown_issuer`）随链记录、不可变：事后注册该主体
+  （含直接注册匹配密钥、或注册后轮换到匹配旧签名的密钥）都不会翻转原验签拒绝；
+  服务重启时的旧库回填也不会把这类签发者归到后来注册的密钥代次
+  （演练见[提交时未注册签发者的链](#提交时未注册签发者的链unknown_issuer-不随事后注册翻转)）；
 - 轮换与链提交并发交错时，链记录的密钥代次严格等于提交时实际验签所用的代次；
 - 轮换在单个 `BEGIN IMMEDIATE` 事务内完成：失败（404 / 409 / 写冲突）不会留下部分切换；
 - 已核销请求的同键同内容重放仍返回首次结果（与轮换无关）；任何响应都不携带密钥材料。
@@ -566,6 +572,106 @@ curl -sS -X POST http://localhost:8000/api/v1/chains/rot-chain-after/redeem \
 
 ---
 
+## 提交时未注册签发者的链（unknown_issuer 不随事后注册翻转）
+
+链提交时若某签发者尚未注册，验签以 `unknown_issuer` 失败并随链持久化（失败也会落库）。
+**“提交时缺失密钥”这一事实随链保存**：事后注册该主体——哪怕轮换到恰好匹配旧签名的
+密钥——链查询、同内容重放、只读求值与首次核销都保持提交时的验签拒绝；服务重启时的
+旧库回填同样不会把这类签发者归到后来注册的密钥代次（原本有效的旧链仍按提交时的
+历史代次验签）。
+
+> **修复前行为（已修复）**：旧版本没有持久化“提交时未注册”这一事实，重放 / 求值 /
+> 核销会回退到**当前**密钥重验——事后注册主体并轮换到匹配旧签名的密钥后，同内容
+> 重放与只读求值可能翻转为放行，首次核销也可能成功；重启回填还会把旧链误绑到后来
+> 注册的密钥代次。下面的演练在修复后的服务上执行，所有入口始终保持 `unknown_issuer`。
+> 假设服务已通过 `docker compose up --build` 启动在 `http://localhost:8000`。
+
+```bash
+# 签名助手：生成 root -> ghost-demo 的两级链，child 用 ghost-secret 签名
+build_ghost_chain() {
+  PYTHONPATH=. CHAIN_ID="$1" python3 - <<'PY'
+import json, os
+from datetime import datetime, timedelta, timezone
+from app.security import compute_signature
+
+chain_id    = os.environ["CHAIN_ID"]
+root_secret = os.environ.get("ROOT_HMAC_SECRET", "dev-root-secret-change-me")
+now = datetime.now(timezone.utc)
+nb = (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+na = (now + timedelta(hours=6)).isoformat().replace("+00:00", "Z")
+
+def token(tid, parent, issuer, subject, path, methods, secret):
+    t = {
+        "token_id": tid, "parent_id": parent, "chain_id": chain_id,
+        "issuer": issuer, "subject": subject, "path_pattern": path,
+        "methods": methods, "not_before": nb, "not_after": na,
+        "allow_ip": None, "signature": "",
+    }
+    t["signature"] = compute_signature(t, secret)
+    return t
+
+print(json.dumps({
+    "chain_id": chain_id,
+    "tokens": [
+        token("g-root",  None,    "root",       "ghost-demo",
+              "/files/**", ["GET", "POST"], root_secret),
+        token("g-child", "g-root", "ghost-demo", "ghost-worker",
+              "/files/reports/*", ["GET"], "ghost-secret"),
+    ],
+}, ensure_ascii=False))
+PY
+}
+
+# 1) ghost-demo 尚未注册时提交链：201，integrity.allow=false，
+#    first_failed_reason="unknown_issuer"（失败同样持久化）
+build_ghost_chain ghost-chain-demo > /tmp/ghost-chain.json
+curl -sS -X POST http://localhost:8000/api/v1/chains \
+  -H 'Content-Type: application/json' --data @/tmp/ghost-chain.json
+
+# 2) 事后注册该主体（先装无关密钥），再轮换到恰好匹配旧签名的密钥
+curl -sS -X POST http://localhost:8000/api/v1/principals \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "ghost-demo", "hmac_secret": "unrelated-secret"}'
+curl -sS -X POST http://localhost:8000/api/v1/principals/ghost-demo/rotate-key \
+  -H 'Content-Type: application/json' \
+  -d '{"hmac_secret": "ghost-secret"}'
+# → 200 {"name": "ghost-demo", "generation": 2, "rotated_at": "..."}
+#   此时当前密钥已能匹配旧签名；修复前，下列调用会翻转为放行
+
+# 3) 修复后：查询 / 重放 / 求值 / 首次核销均保持提交时的验签拒绝
+curl -sS http://localhost:8000/api/v1/chains/ghost-chain-demo
+# → "integrity": {"allow": false, "first_failed_reason": "unknown_issuer", ...}
+
+curl -sS -X POST http://localhost:8000/api/v1/chains \
+  -H 'Content-Type: application/json' --data @/tmp/ghost-chain.json
+# → 200，"replayed": true，integrity 仍是 "unknown_issuer"
+
+curl -sS -X POST http://localhost:8000/api/v1/chains/ghost-chain-demo/evaluate \
+  -H 'Content-Type: application/json' \
+  -d "{\"request_path\": \"/files/reports/q1.pdf\", \"method\": \"GET\", \
+      \"at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+# → "decision": "deny", "first_failed_reason": "unknown_issuer"
+
+curl -sS -X POST http://localhost:8000/api/v1/chains/ghost-chain-demo/redeem \
+  -H 'Content-Type: application/json' \
+  -d '{"token_id": "g-child", "request_key": "ghost-redeem-0001",
+       "request_path": "/files/reports/q1.pdf", "method": "GET"}'
+# → 200，"redeemed": false, "decision": "deny"（不核销、不占用 request_key）
+
+# 4) 重启服务（旧库回填）后结论不变
+docker compose restart api
+curl -sS http://localhost:8000/api/v1/chains/ghost-chain-demo
+# → 仍是 "allow": false, "first_failed_reason": "unknown_issuer"
+
+# 5) 主体本身并未被“污染”：ghost-demo 用当前密钥签出的新链照常通过
+build_ghost_chain ghost-chain-fresh > /tmp/ghost-fresh.json
+curl -sS -X POST http://localhost:8000/api/v1/chains \
+  -H 'Content-Type: application/json' --data @/tmp/ghost-fresh.json
+# → 201，"integrity": {"allow": true, ...}
+```
+
+---
+
 ## 规范化 JSON 与签名（重要）
 
 签名覆盖除 `signature` 外的下列字段（固定集合、固定键顺序无关，因为规范化时按键排序）：
@@ -625,7 +731,7 @@ token["signature"] = compute_signature(token, issuer_secret)
 | `cycle`                   | 沿 `parent_id` 上行检测到环                |
 | `branch`                  | 同一父令牌被两个子令牌引用（链不允许分叉） |
 | `disconnected`            | 令牌无法从根授权到达                       |
-| `unknown_issuer`          | 签发主体未注册，无法取密钥                 |
+| `unknown_issuer`          | 签发主体未注册，无法取密钥（该事实随链保存，事后注册不翻转结论） |
 | `bad_signature`           | HMAC 验签不通过                            |
 | `issuer_mismatch`         | 根签发者不是配置根主体，或委托者 ≠ 父主体  |
 | `path_widens`             | 子路径相对父路径构成放大                   |
@@ -659,7 +765,7 @@ token["signature"] = compute_signature(token, issuer_secret)
 │   ├── database.py    # SQLite 初始化与迁移、主体密钥代次/链/撤销/核销持久化
 │   └── config.py      # 环境变量配置
 ├── scripts/demo_chain.py
-├── tests/             # pytest：96 个用例（端到端 API、原语单测、撤销审计、一次性核销、密钥轮换）
+├── tests/             # pytest：102 个用例（端到端 API、原语单测、撤销审计、一次性核销、密钥轮换、unknown_issuer 固化）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

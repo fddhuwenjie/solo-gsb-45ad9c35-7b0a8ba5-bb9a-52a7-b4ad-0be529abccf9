@@ -21,6 +21,7 @@ from .database import (
     install_next_key_generation,
     load_chain_key_generations,
     load_chain_record,
+    load_chain_unknown_issuers,
     load_redemption_by_request_key,
     load_redemption_for_token,
     load_redemptions,
@@ -71,24 +72,31 @@ app = FastAPI(
         "客户端提交根授权和以 parent_id 相连的委托令牌；服务验签、检测断链与环，"
         "并强制路径 / 方法 / 时间窗 / IP 网段只能逐级收窄。"
         "支持按时间生效的不可变撤销事件、请求级判定、链末端令牌的一次性访问核销，"
-        "以及按代次管理的签发主体 HMAC 密钥轮换（既有链按提交时锁定的代次重验）。"
+        "以及按代次管理的签发主体 HMAC 密钥轮换（既有链按提交时锁定的代次重验；"
+        "提交时未注册的签发者随链记录，事后注册不翻转原结论）。"
     ),
-    version="1.3.0",
+    version="1.3.1",
     lifespan=lifespan,
 )
 
 
 def _chain_secret_lookup(conn: sqlite3.Connection, chain_id: str):
-    """按链提交时锁定的密钥代次构造验签查询。
+    """按链提交时锁定的密钥归属构造验签查询。
 
     - 提交时已注册的主体：固定使用链归属记录中的那一代密钥——轮换不影响
       既有链的验签结论，既有无效链也不会因新密钥恰好匹配而翻转为有效；
-    - 提交时未注册的主体（无归属记录）：回退到当前密钥，保留“主体后注册
-      可补验”的既有语义。
+    - 提交时未注册的主体（``chain_unknown_issuers`` 有记录）：一律返回
+      ``None``，重放 / 求值 / 核销保持提交时的 ``unknown_issuer`` 拒绝——
+      事后注册该主体（甚至轮换到匹配旧签名的密钥）都不会翻转结论；
+    - 两条归属记录都没有（仅见于修复前落库且尚未回填的库）：回退到当前
+      密钥，保留旧库在回填完成前的既有语义。
     """
     recorded = load_chain_key_generations(conn, chain_id)
+    unknown = load_chain_unknown_issuers(conn, chain_id)
 
     def lookup(name: str) -> str | None:
+        if name in unknown:
+            return None
         generation = recorded.get(name)
         if generation is None:
             return get_secret(conn, name)
@@ -167,6 +175,8 @@ def submit_chain(
 
     验签严格使用“提交时各签发主体的当前密钥代次”快照，并把该代次归属随链
     持久化：与并发轮换交错时，链的密钥归属与提交时的验签结果始终一致。
+    提交时未注册的签发者（unknown_issuer）这一事实同样随链持久化：事后
+    注册该主体不会让既有链的验签结论翻转。
     """
     received_hash = canonical_submission_hash(
         submission.chain_id, submission.tokens
@@ -199,7 +209,8 @@ def submit_chain(
             },
         )
 
-    # 新链：先快照各签发主体的当前密钥与代次，验签与归属记录使用同一快照
+    # 新链：先快照各签发主体的当前密钥与代次，验签与归属记录使用同一快照；
+    # 快照外的签发者（提交时未注册）同样随链持久化，事后注册不得翻转结论
     snapshot = snapshot_current_keys(
         conn, {t.issuer for t in submission.tokens}
     )
@@ -213,6 +224,9 @@ def submit_chain(
         received_hash,
         report,
         {name: generation for name, (_, generation) in snapshot.items()},
+        unknown_issuers={
+            t.issuer for t in submission.tokens if t.issuer not in snapshot
+        },
     )
     result = SubmissionResult(
         chain_id=submission.chain_id, replayed=False, integrity=report

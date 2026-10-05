@@ -61,6 +61,16 @@ CREATE TABLE IF NOT EXISTS chain_key_generations (
     FOREIGN KEY (chain_id) REFERENCES chains (chain_id)
 );
 
+-- 每条链在提交时“签发者未注册、无法取得密钥”的事实（随链写入，之后不可变）。
+-- 命中该表的签发者在重放 / 求值 / 核销重验时一律按 unknown_issuer 处理：
+-- 事后注册该主体（甚至轮换到匹配旧签名的密钥）都不会翻转原验签拒绝。
+CREATE TABLE IF NOT EXISTS chain_unknown_issuers (
+    chain_id  TEXT NOT NULL,
+    principal TEXT NOT NULL,
+    PRIMARY KEY (chain_id, principal),
+    FOREIGN KEY (chain_id) REFERENCES chains (chain_id)
+);
+
 -- 撤销事件为只追加（append-only）审计记录：无更新 / 删除路径。
 -- request_key 全局唯一（跨链也不可复用）；同一令牌至多一条有效撤销事件。
 CREATE TABLE IF NOT EXISTS revocations (
@@ -170,7 +180,9 @@ def _backfill_key_tables(conn: sqlite3.Connection) -> None:
 
     - 尚无密钥历史的主体：以其当前 hmac_secret 作为第 1 代（轮换过的主体已有
       历史行，INSERT OR IGNORE 自然跳过，不会用当前密钥覆盖旧代次）；
-    - 既有链：按提交内出现且当时已注册的签发者，归属到第 1 代。
+    - 既有链：先从不可变的提交时完整性报告还原“提交时签发者未注册”的事实
+      （见 :func:`_backfill_unknown_issuers`），再按提交内出现且当时已注册的
+      签发者归属到第 1 代——提交时未注册的签发者不得归到后来注册的代次。
     """
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
@@ -179,11 +191,56 @@ def _backfill_key_tables(conn: sqlite3.Connection) -> None:
         "SELECT name, 1, hmac_secret, ? FROM principals",
         (now,),
     )
+    _backfill_unknown_issuers(conn)
     conn.execute(
         "INSERT OR IGNORE INTO chain_key_generations (chain_id, principal, generation) "
         "SELECT DISTINCT t.chain_id, json_extract(t.token_json, '$.issuer'), 1 "
         "FROM tokens t JOIN principals p "
-        "ON p.name = json_extract(t.token_json, '$.issuer')"
+        "ON p.name = json_extract(t.token_json, '$.issuer') "
+        "WHERE NOT EXISTS ("
+        "    SELECT 1 FROM chain_unknown_issuers u "
+        "    WHERE u.chain_id = t.chain_id "
+        "    AND u.principal = json_extract(t.token_json, '$.issuer')"
+        ")"
+    )
+
+
+def _backfill_unknown_issuers(conn: sqlite3.Connection) -> None:
+    """从既有链的提交时完整性报告还原“签发者未注册”的事实（幂等）。
+
+    报告随链落库且不可变：其中 signature 检查以 ``unknown_issuer`` 失败的
+    签发者，即提交时未注册的主体。把它们记入 ``chain_unknown_issuers``，
+    并移除旧版回填可能误写入的代次归属（提交时未注册的签发者不得归到
+    后来注册的代次）。``save_chain`` 只为提交时已注册的主体写代次归属，
+    与该集合天然互斥，因此这里的清理不会误伤正常归属。
+    """
+    rows = conn.execute("SELECT chain_id, report_json FROM chains").fetchall()
+    unknown: set[tuple[str, str]] = set()
+    for row in rows:
+        try:
+            report = json.loads(row["report_json"])
+        except (TypeError, ValueError):
+            continue  # 报告损坏时无从判定，保持既有归属不动
+        for node in report.get("trace", []):
+            issuer = node.get("issuer")
+            if not issuer:
+                continue
+            for check in node.get("checks", []):
+                if (
+                    check.get("name") == "signature"
+                    and check.get("passed") is False
+                    and check.get("reason") == "unknown_issuer"
+                ):
+                    unknown.add((row["chain_id"], issuer))
+    conn.executemany(
+        "INSERT OR IGNORE INTO chain_unknown_issuers (chain_id, principal) "
+        "VALUES (?, ?)",
+        sorted(unknown),
+    )
+    # 纠正旧版回填的误绑：提交时未注册的签发者不得占有任何代次归属
+    conn.execute(
+        "DELETE FROM chain_key_generations WHERE (chain_id, principal) IN "
+        "(SELECT chain_id, principal FROM chain_unknown_issuers)"
     )
 
 
@@ -288,14 +345,31 @@ def load_chain_key_generations(
     return {r["principal"]: r["generation"] for r in rows}
 
 
+def load_chain_unknown_issuers(
+    conn: sqlite3.Connection, chain_id: str
+) -> set[str]:
+    """链在提交时未注册（无法取得密钥）的签发者集合（无记录时为空集）。"""
+    rows = conn.execute(
+        "SELECT principal FROM chain_unknown_issuers WHERE chain_id = ?",
+        (chain_id,),
+    ).fetchall()
+    return {r["principal"] for r in rows}
+
+
 def save_chain(
     conn: sqlite3.Connection,
     submission: ChainSubmission,
     content_sha256: str,
     report: IntegrityReport,
     key_generations: dict[str, int],
+    unknown_issuers: Iterable[str] = (),
 ) -> None:
-    """持久化链及其提交时锁定的密钥代次归属（同一事务，要么全部落库要么都不落）。"""
+    """持久化链及其提交时锁定的密钥归属（同一事务，要么全部落库要么都不落）。
+
+    ``key_generations`` 记录提交时已注册主体的密钥代次；``unknown_issuers``
+    记录提交时未注册（无法取得密钥）的签发者。两者随链保存、之后不可变，
+    重放 / 求值 / 核销重验时据此复现提交时的验签结论。
+    """
     created_at = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "INSERT INTO chains (chain_id, content_sha256, report_json, created_at) "
@@ -321,6 +395,10 @@ def save_chain(
             (submission.chain_id, name, generation)
             for name, generation in sorted(key_generations.items())
         ],
+    )
+    conn.executemany(
+        "INSERT INTO chain_unknown_issuers (chain_id, principal) VALUES (?, ?)",
+        [(submission.chain_id, name) for name in sorted(unknown_issuers)],
     )
 
 
